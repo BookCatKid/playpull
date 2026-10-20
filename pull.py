@@ -191,6 +191,8 @@ def get_details(api, pkg):
     try:
         doc = msg.payload.detailsResponse.docV2
         det = doc.details.appDetails
+        if not det.versionString or not det.versionCode:
+            raise AttributeError('empty appDetails')
         return doc, det.versionString, det.versionCode
     except AttributeError:
         raise PullError('fdfe', 'no details for %s (http %s, err=%s). Not served to this '
@@ -229,8 +231,13 @@ def cmd_pull(cfg, pkg, want, pin_arg):
     pmsg = parse_wrapper(pr)
     br = pmsg.payload.buyResponse
     if not br.downloadToken:
-        raise PullError('fdfe', 'purchase returned no download token (err=%s)'
-                        % (pmsg.commands.displayErrorMessage or 'none'))
+        err = pmsg.commands.displayErrorMessage or 'none'
+        hint = ''
+        if 'DF-DFERH-01' in err:
+            hint = (' For a specific app (while others pull fine) this usually means the account '
+                    'is not eligible for it - typical causes: age-restricted rating (17+/18+) on an '
+                    'account without verified age, or a developer-side acquisition restriction.')
+        raise PullError('fdfe', 'purchase returned no download token (err=%s).%s' % (err, hint))
     dl = _req('GET', FDFE + 'delivery', h, params={'doc': pkg, 'vc': str(vc), 'ot': '1',
               'dtok': br.downloadToken}, stage='fdfe')
     dmsg = parse_wrapper(dl)

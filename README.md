@@ -75,7 +75,8 @@ UA and profile stay current in config.json as cheap insurance; bump
 | `auth: AAS token rejected (BadAuthentication)` | token revoked: password/2SV change, "sign out all devices", security lockdown, manual revocation at myaccount.google.com/permissions | `xvfb-run -a python3 mint_aas.py` (one 2SV code) |
 | `device: device id rejected (DF-DFERH-01)` or empty catalog | registration pruned after long inactivity | remove gsf_id/security_token from config.json, then `python3 pull.py init` |
 | `fdfe: server 5xx` / network errors | transient | automatic retries (3x backoff); just rerun |
-| `no details for ...` | package typo, or the staged rollout has not reached this account/device cohort | check the id; cohorts lag, retry later |
+| `no details for ...` / `Item not found` | package typo, delisted app, region lock, device filter (sdk too old), or the staged rollout has not reached this cohort | check the id; cohorts lag, retry later |
+| purchase `DF-DFERH-01` on a specific app while others pull fine | account not eligible: measured on Mature 17+ rated apps with an account that has no verified age (also developer acquisition restrictions) | use an account with verified age; not client-fixable |
 | everything else stale | Google bumped minimum client | bump `finsky.*` in config.json |
 
 `check`/`pull` auto-refresh the checkin once a day, keeping the registration alive.
