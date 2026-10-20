@@ -1,0 +1,6 @@
+{
+  "email": "your-account@gmail.com",
+  "gsf_id": "1234567890123456789",
+  "package": "com.sonos.acr2",
+  "expected_signer_sha256": "7C34EB3CFBDA05FAF56E8890A2ABBAC14B3036E6E4358849B98E8819B6B7B329"
+}

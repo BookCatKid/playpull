@@ -1,0 +1,9 @@
+# credentials & session material - never commit
+aas_token
+config.json
+cookies*
+*.log
+logcat*
+*.har
+oauth_token*
+__pycache__/
