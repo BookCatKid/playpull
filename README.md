@@ -8,7 +8,7 @@ mirrors. Works for any free app.
 ## Quickstart
 
 ```
-pip install gpsoauth googleplay-api androguard playwright requests
+pip install gpsoauth googleplay-api androguard cryptography playwright requests
 python3 -m playwright install chromium
 cp config.example.json config.json   # fill in email; leave the rest as shipped
 
@@ -24,13 +24,28 @@ Downloads land in `./<package>/` (base.apk + split_*.apk).
 
 ## Trust model
 
-`pull` always verifies the downloaded base APK's package name and version prefix.
-For the signing certificate you choose per app:
+Every downloaded file is verified before it reaches `./<package>/`:
+
+- the sha256 of each file is checked against the hash Play's delivery response
+  carries for it;
+- each split's APK Signature Scheme v2/v3 block is cryptographically verified in
+  pure python (signature over the signed data plus the content digest over the
+  whole file - a modified or truncated APK fails, v1-only files are rejected);
+- all splits must be signed by the SAME certificate;
+- the base APK's package name must equal the request and its versionCode must
+  equal the versionCode Play said it would serve;
+- downloads stage into `./<package>/.staging-<versionCode>/` and only move into
+  the package dir after every check passes, so a failed pull can never leave a
+  mix of old and new files or clobber a previously verified set.
+
+On top of that you choose per app:
 
 - `--pin-sha256 HEX` requires an exact signer match; the pin is saved in config.json
   and enforced on later pulls without the flag. A mismatch aborts with a loud error.
-- Without a pin, the actual signer sha256 + subject is printed (trust on first use)
-  and nothing is enforced until you pin.
+- Without a pin the signature is still verified, but the signer is reported as
+  UNVERIFIED (TOFU): a valid signature only proves the file matches its own
+  certificate, not that the certificate is the developer's. Pin it after checking
+  the fingerprint out-of-band.
 
 This catches the classic mirror trap: aggregator sites sometimes serve re-signed
 installer stubs under the real app's name. A genuine Play download verifies against
