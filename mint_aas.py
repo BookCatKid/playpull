@@ -74,10 +74,12 @@ with sync_playwright() as pw:
         sys.exit("no oauth_token cookie - flow did not complete (url=%s)" % pg.url)
     ctx.close()
 
-r = gpsoauth.exchange_token(email, oauth, CFG['gsf_id'])
+r = gpsoauth.exchange_token(email, oauth, CFG.get('gsf_id') or '0')
 if 'Error' in r:
     sys.exit("exchange failed: %s (oauth_token is single-use; rerun mint_aas.py)" % r)
 out = os.path.join(DIR, 'aas_token')
 open(out, 'w').write(r['Token'])
 os.chmod(out, 0o600)
 print("AAS token written to", out)
+if not CFG.get('gsf_id'):
+    print("next step: python3 pull.py init   (registers a fresh device identity)")

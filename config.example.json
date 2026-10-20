@@ -1,6 +1,36 @@
 {
   "email": "your-account@gmail.com",
-  "gsf_id": "1234567890123456789",
+  "gsf_id": "",
+  "security_token": "",
+  "consistency_token": "",
+  "digest": "",
+  "last_checkin": 0,
   "package": "com.sonos.acr2",
-  "expected_signer_sha256": "7C34EB3CFBDA05FAF56E8890A2ABBAC14B3036E6E4358849B98E8819B6B7B329"
+  "cert_sha256": "7C34EB3CFBDA05FAF56E8890A2ABBAC14B3036E6E4358849B98E8819B6B7B329",
+  "finsky": {
+    "version": "85361530",
+    "versionstring": "53.6.15-31 [0] [PR] 996698724"
+  },
+  "device": {
+    "userreadablename": "Pixel 7 (api33)",
+    "build.hardware": "panther",
+    "build.brand": "google",
+    "build.device": "panther",
+    "build.model": "Pixel 7",
+    "build.manufacturer": "Google",
+    "build.product": "panther",
+    "build.id": "TQ3A.230805.001.S1",
+    "build.version.sdk_int": "33",
+    "build.version.release": "13",
+    "build.fingerprint": "google/panther/panther:13/TQ3A.230805.001.S1/10754032:user/release-keys",
+    "screen.density": "420",
+    "screen.width": "1080",
+    "screen.height": "2400",
+    "platforms": "arm64-v8a,armeabi-v7a,armeabi",
+    "gl.version": "196610",
+    "gsf.version": "234914030",
+    "celloperator": "310260",
+    "simoperator": "310260",
+    "timezone": "America/Los_Angeles"
+  }
 }
