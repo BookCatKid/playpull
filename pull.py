@@ -2,14 +2,18 @@
 """playpull - pure-python Google Play APK puller. No emulator, no physical device.
 
 Commands:
-  init            Register a fresh device identity to the account (one-time; writes
-                  gsf_id + tokens into config.json). Requires aas_token (run mint_aas.py first).
-  check           Print the version Play would serve this account/device cohort.
-  pull PREFIX     If the served version starts with PREFIX: purchase, download all
-                  splits, verify package name + version + signing certificate.
-  selfcheck       Stage-by-stage health check with remedies for each failure.
-  checkin         Re-checkin with the stored device id (keeps the registration alive
-                  if you run pull.py rarely; check/pull do this automatically once a day).
+  init                         Register a fresh device identity to the account (one-time;
+                               writes gsf_id + tokens into config.json). Requires aas_token
+                               (run mint_aas.py first).
+  check PACKAGE                Print the version Play would serve this account/device cohort.
+  pull PACKAGE [PREFIX]        Purchase (free apps only), download all splits, verify.
+                               PREFIX: only proceed if the served version starts with it.
+                               --pin-sha256 HEX: require this signer certificate (saved to
+                               config for next time). Without a pin the actual signer is
+                               printed (trust on first use: re-run with --pin-sha256 to pin).
+  selfcheck                    Stage-by-stage health check with remedies for each failure.
+  checkin                      Re-checkin with the stored device id (check/pull do this
+                               automatically once a day).
 
 Secrets: config.json (gitignored) holds email + device ids; aas_token (gitignored, chmod 600)
 holds the master token. Neither is ever printed. See README.md for the full flow.
@@ -83,27 +87,14 @@ def oauth(email, aas, android_id, service, app, sdk=29):
         raise PullError('auth', 'token mint failed: %s' % r)
     return r['Auth']
 
-def post_with_retry(url, headers, data=None, params=None, tries=3, stage='network'):
+def _req(method, url, headers, data=None, params=None, tries=3, stage='network'):
     last = None
     for i in range(tries):
         try:
-            r = requests.post(url, headers=headers, data=data, params=params, timeout=60)
+            r = requests.request(method, url, headers=headers, data=data, params=params, timeout=60)
             if r.status_code < 500:
                 return r
-            last = PullError(stage, 'server %s from %s' % (r.status_code, url.rsplit('/',1)[-1]))
-        except requests.RequestException as e:
-            last = PullError(stage, '%s' % e, 'transient network failure - retry')
-        time.sleep(1.5 * (i + 1))
-    raise last
-
-def get_with_retry(url, headers, params=None, tries=3, stage='network'):
-    last = None
-    for i in range(tries):
-        try:
-            r = requests.get(url, headers=headers, params=params, timeout=60)
-            if r.status_code < 500:
-                return r
-            last = PullError(stage, 'server %s from %s' % (r.status_code, url.rsplit('/',1)[-1]))
+            last = PullError(stage, 'server %s from %s' % (r.status_code, url.rsplit('/', 1)[-1]))
         except requests.RequestException as e:
             last = PullError(stage, '%s' % e, 'transient network failure - retry')
         time.sleep(1.5 * (i + 1))
@@ -130,7 +121,7 @@ def do_checkin(cfg, builder, email, ac2dm, android_id=0, security_token=0, bind_
         req.accountCookie.append(ac2dm)
     h = dict(builder.getAuthHeaders(None))
     h['Content-Type'] = 'application/x-protobuffer'   # mandatory; missing = HTTP 400
-    r = post_with_retry(CHECKIN_URL, h, data=req.SerializeToString(), stage='checkin')
+    r = _req('POST', CHECKIN_URL, h, data=req.SerializeToString(), stage='checkin')
     resp = googleplay_pb2.AndroidCheckinResponse()
     try:
         resp.ParseFromString(r.content)
@@ -187,50 +178,61 @@ def build_api(cfg):
     api.setAuthSubToken(tok)
     return api
 
-def fdfe_headers(api):
-    return api.getHeaders()
-
 def parse_wrapper(resp):
     return googleplay_pb2.ResponseWrapper.FromString(resp.content)
 
-def served_version(api, pkg):
-    r = get_with_retry(FDFE + 'details', fdfe_headers(api), params={'doc': pkg}, stage='fdfe')
+def get_details(api, pkg):
+    r = _req('GET', FDFE + 'details', api.getHeaders(), params={'doc': pkg}, stage='fdfe')
     msg = parse_wrapper(r)
     err = msg.commands.displayErrorMessage
     if r.status_code == 400 and 'DF-DFERH-01' in err:
         raise PullError('device', 'device id rejected (DF-DFERH-01) - registration lost or header invalid',
                         'remove gsf_id/security_token from config.json, then: python3 pull.py init')
     try:
-        det = msg.payload.detailsResponse.docV2.details.appDetails
-        return det.versionString, det.versionCode
+        doc = msg.payload.detailsResponse.docV2
+        det = doc.details.appDetails
+        return doc, det.versionString, det.versionCode
     except AttributeError:
-        raise PullError('fdfe', 'no details for %s (http %s, err=%s). The store returned an '
-                        'empty catalog for this device id - registration may be incomplete'
+        raise PullError('fdfe', 'no details for %s (http %s, err=%s). Not served to this '
+                        'device/account cohort, or the package does not exist'
                         % (pkg, r.status_code, err or 'none'),
-                        'python3 pull.py selfcheck')
+                        'check the package id; staged rollouts also lag by cohort')
+
+def offer_price(doc):
+    """(micros, currency) of the first offer; (0, '') when free or unknown."""
+    try:
+        o = doc.offer[0]
+        return o.micros, o.currencyCode
+    except Exception:
+        return 0, ''
 
 def cmd_check(cfg, pkg):
     api = build_api(cfg)
     maybe_refresh_checkin(cfg)
-    vs, vc = served_version(api, pkg)
+    _, vs, vc = get_details(api, pkg)
     print('served: %s (vc %s)' % (vs, vc))
     return vs, vc
 
-def cmd_pull(cfg, pkg, want):
+def cmd_pull(cfg, pkg, want, pin_arg):
     api = build_api(cfg)
     maybe_refresh_checkin(cfg)
-    vs, vc = served_version(api, pkg)
+    doc, vs, vc = get_details(api, pkg)
     print('served: %s (vc %s)' % (vs, vc))
     if want and not vs.startswith(want):
         print('prefix %s not in served version - not pulling' % want); sys.exit(2)
-    h = fdfe_headers(api); h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
-    pr = post_with_retry(FDFE + 'purchase', h, data={'ot': '1', 'doc': pkg, 'vc': str(vc)}, stage='fdfe')
-    br = parse_wrapper(pr).payload.buyResponse
+    micros, currency = offer_price(doc)
+    if micros:
+        raise PullError('fdfe', '%s is a paid app (%s %.2f). playpull only acquires free apps - '
+                        'no purchase made' % (pkg, currency or '', micros / 1e6))
+    h = api.getHeaders(); h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+    pr = _req('POST', FDFE + 'purchase', h, data={'ot': '1', 'doc': pkg, 'vc': str(vc)}, stage='fdfe')
+    pmsg = parse_wrapper(pr)
+    br = pmsg.payload.buyResponse
     if not br.downloadToken:
         raise PullError('fdfe', 'purchase returned no download token (err=%s)'
-                        % (parse_wrapper(pr).commands.displayErrorMessage or 'none'))
-    dl = get_with_retry(FDFE + 'delivery', h, params={'doc': pkg, 'vc': str(vc), 'ot': '1',
-                        'dtok': br.downloadToken}, stage='fdfe')
+                        % (pmsg.commands.displayErrorMessage or 'none'))
+    dl = _req('GET', FDFE + 'delivery', h, params={'doc': pkg, 'vc': str(vc), 'ot': '1',
+              'dtok': br.downloadToken}, stage='fdfe')
     dmsg = parse_wrapper(dl)
     dd = dmsg.payload.deliveryResponse.appDeliveryData
     if not dd.downloadUrl:
@@ -238,6 +240,8 @@ def cmd_pull(cfg, pkg, want):
                         % (dmsg.commands.displayErrorMessage or 'none'))
     cookie = '; '.join('%s=%s' % (c.name, c.value) for c in dd.downloadAuthCookie)
     targets = [('base.apk', dd.downloadUrl)] + [('split_%s.apk' % s.name, s.downloadUrl) for s in dd.split]
+    outdir = os.path.join(DIR, pkg)
+    os.makedirs(outdir, exist_ok=True)
     for name, url in targets:
         for attempt in range(3):
             r = requests.get(url, headers={'Cookie': cookie}, timeout=600)
@@ -246,30 +250,53 @@ def cmd_pull(cfg, pkg, want):
             time.sleep(2 * (attempt + 1))
         else:
             raise PullError('network', 'download of %s failed (http %s)' % (name, r.status_code), 'retry')
-        open(os.path.join(DIR, name), 'wb').write(r.content)
-        print('downloaded %s %d bytes' % (name, len(r.content)))
-    verify(cfg, pkg, want)
+        open(os.path.join(outdir, name), 'wb').write(r.content)
+        print('downloaded %s/%s %d bytes' % (pkg, name, len(r.content)))
+    verify(cfg, pkg, want, pin_arg, outdir)
 
-def verify(cfg, pkg, want):
+def signer_info(apk_path):
     from androguard.core.apk import APK
-    a = APK(os.path.join(DIR, 'base.apk'))
+    a = APK(apk_path)
     certs = list(a.get_certificates())
     sha256 = certs[0].sha256_fingerprint.replace(' ', '').upper() if certs else ''
-    expect = (cfg.get('cert_sha256') or '').upper()
-    checks = [('package', a.get_package() == pkg, a.get_package()),
-              ('version', (not want) or a.get_androidversion_name().startswith(want), a.get_androidversion_name()),
-              ('signer', (not expect) or sha256 == expect, sha256[:16] + '...')]
-    bad = [c for c in checks if not c[1]]
-    for name, ok, got in checks:
-        print('verify %-8s %s (%s)' % (name, 'OK' if ok else 'MISMATCH', got))
-    if bad:
-        raise PullError('verify', 'APK failed verification: %s' % ', '.join(c[0] for c in bad),
-                        'do NOT use these files; the source is not who it claims to be')
-    print('GENUINE - signature matches the expected release certificate')
+    subj = ''
+    try:
+        subj = certs[0].subject.human_friendly
+    except AttributeError:
+        try:
+            subj = certs[0].subject.rfc4514_string()
+        except Exception:
+            subj = '?'
+    return a, sha256, subj
 
-def cmd_selfcheck(cfg_path_hint=None):
+def verify(cfg, pkg, want, pin_arg, outdir):
+    a, sha256, subj = signer_info(os.path.join(outdir, 'base.apk'))
+    pin = (pin_arg or (cfg.get('pins') or {}).get(pkg) or '').upper()
+    if a.get_package() != pkg:
+        raise PullError('verify', 'package mismatch: got %s, wanted %s - do NOT use these files'
+                        % (a.get_package(), pkg))
+    print('verify package  OK (%s)' % pkg)
+    if want and not a.get_androidversion_name().startswith(want):
+        raise PullError('verify', 'version mismatch: got %s, wanted prefix %s'
+                        % (a.get_androidversion_name(), want))
+    print('verify version  OK (%s)' % a.get_androidversion_name())
+    print('signer sha256   %s' % sha256)
+    print('signer subject  %s' % subj)
+    if pin:
+        if sha256 != pin:
+            raise PullError('verify', 'SIGNER MISMATCH: got %s, pinned %s - do NOT use these files'
+                            % (sha256[:16] + '...', pin[:16] + '...'))
+        if pin_arg:
+            cfg.setdefault('pins', {})[pkg] = pin
+            save_config(cfg)
+        print('verify signer   OK (matches pinned certificate)')
+    else:
+        print('verify signer   UNPINNED - first observation, nothing to compare against.')
+        print('                If you trust this signer, pin it: python3 pull.py pull %s %s '
+              '--pin-sha256 %s' % (pkg, want or '', sha256))
+
+def cmd_selfcheck():
     print('playpull selfcheck')
-    ok = True
     try:
         cfg = load_config(require_device=False)
         print('  [ok] config.json parses; email set')
@@ -289,7 +316,8 @@ def cmd_selfcheck(cfg_path_hint=None):
         print('  [FAIL] device: not registered\n         fix: python3 pull.py init'); sys.exit(1)
     print('  [ok] device registered (gsf_id present)')
     try:
-        cmd_check(cfg, cfg.get('package', 'com.sonos.acr2'))
+        api = build_api(cfg)
+        get_details(api, 'com.android.vending')
         print('  [ok] FDFE details works - pipeline healthy')
     except PullError as e:
         print('  [FAIL] fdfe: %s\n         fix: %s' % (e, e.remedy)); sys.exit(1)
@@ -297,17 +325,27 @@ def cmd_selfcheck(cfg_path_hint=None):
 
 USAGE = __doc__
 if __name__ == '__main__':
-    cmd = sys.argv[1] if len(sys.argv) > 1 else 'check'
+    argv = sys.argv[1:]
+    pin = None
+    if '--pin-sha256' in argv:
+        i = argv.index('--pin-sha256')
+        try:
+            pin = argv[i + 1]
+        except IndexError:
+            print('--pin-sha256 needs a hex value'); sys.exit(2)
+        del argv[i:i + 2]
+    cmd = argv[0] if argv else 'check'
     try:
         if cmd == 'init':
             cmd_init(load_config(require_device=False))
         elif cmd == 'check':
-            cmd_check(load_config(), load_config().get('package', 'com.sonos.acr2'))
+            if len(argv) < 2:
+                print('usage: pull.py check PACKAGE'); sys.exit(2)
+            cmd_check(load_config(), argv[1])
         elif cmd == 'pull':
-            if len(sys.argv) < 3:
-                print('usage: pull.py pull VERSION_PREFIX'); sys.exit(2)
-            cfg = load_config()
-            cmd_pull(cfg, cfg.get('package', 'com.sonos.acr2'), sys.argv[2])
+            if len(argv) < 2:
+                print('usage: pull.py pull PACKAGE [VERSION_PREFIX] [--pin-sha256 HEX]'); sys.exit(2)
+            cmd_pull(load_config(), argv[1], argv[2] if len(argv) > 2 else '', pin)
         elif cmd == 'selfcheck':
             cmd_selfcheck()
         elif cmd == 'checkin':

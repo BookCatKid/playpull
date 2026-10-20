@@ -5,8 +5,7 @@
   "consistency_token": "",
   "digest": "",
   "last_checkin": 0,
-  "package": "com.sonos.acr2",
-  "cert_sha256": "7C34EB3CFBDA05FAF56E8890A2ABBAC14B3036E6E4358849B98E8819B6B7B329",
+  "pins": {},
   "finsky": {
     "version": "85361530",
     "versionstring": "53.6.15-31 [0] [PR] 996698724"
