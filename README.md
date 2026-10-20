@@ -114,6 +114,12 @@ UA and profile stay current in config.json as cheap insurance; bump
 `selfcheck` diagnoses in order: config -> token file -> AAS validity -> device
 registration -> live FDFE call, printing the exact remedy for the failed stage.
 
+## Tests
+
+`python3 tests/run_fixtures.py` - offline fixture-matrix test for the signature
+verifier (11 crafted APKs, expected accept/reject matches the reference
+apksigner). See tests/README.md.
+
 ## Notes
 
 - The served version depends on the account+device cohort (staged rollouts).

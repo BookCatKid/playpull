@@ -7,3 +7,4 @@ logcat*
 *.har
 oauth_token*
 __pycache__/
+__pycache__/
