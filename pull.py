@@ -326,13 +326,17 @@ def cmd_pull(cfg, pkg, want, pin_arg):
     for s in dd.split:
         expect['split_%s.apk' % s.name] = (s.downloadUrl, _sha(s.sha256))
     outdir = os.path.join(DIR, pkg)
-    # stage into a version-specific dir; the final dir is only touched after every
-    # file is downloaded, hashed, and signature-verified - a failed pull can never
-    # leave a mix of old and new files or clobber a previously verified set.
-    stage = os.path.join(outdir, '.staging-%s' % vc)
+    os.makedirs(outdir, exist_ok=True)
+    # stage next to the final dir (same filesystem); the staged set is promoted
+    # to the immutable version dir with ONE atomic rename after every check has
+    # passed - a failed pull can never leave a mix of old and new files or
+    # clobber a previously verified set.
+    final = os.path.join(outdir, 'v%s' % vc)
+    stage = os.path.join(outdir, '.staging-%s-%s' % (vc, os.getpid()))
     if os.path.isdir(stage):
         shutil.rmtree(stage)
     os.makedirs(stage)
+    strict_hashes = cfg.get('strict_hashes', False)
     for name, (url, want_sha) in expect.items():
         for attempt in range(3):
             r = requests.get(url, headers={'Cookie': cookie}, timeout=600)
@@ -342,29 +346,46 @@ def cmd_pull(cfg, pkg, want, pin_arg):
         else:
             raise PullError('network', 'download of %s failed (http %s)' % (name, r.status_code), 'retry')
         digest = hashlib.sha256(r.content).hexdigest()
-        if want_sha and digest.lower() != want_sha.lower():
-            raise PullError('verify', 'sha256 mismatch on %s: server said %s, got %s - '
-                            'file discarded' % (name, want_sha[:16] + '...', digest[:16] + '...'))
+        if want_sha:
+            if digest.lower() != want_sha.lower():
+                raise PullError('verify', 'sha256 mismatch on %s: server said %s, got %s - '
+                                'file discarded' % (name, want_sha[:16] + '...', digest[:16] + '...'))
+            note = ' (matches server)'
+        elif strict_hashes:
+            raise PullError('verify', 'Play supplied no sha256 for %s - refusing the file '
+                            '(strict_hashes is set)' % name)
+        else:
+            note = ' - WARNING: server supplied NO hash for this file, cannot cross-check'
+            print('warning: Play supplied no sha256 for %s - skipping the hash cross-check' % name)
         part = os.path.join(stage, name + '.part')
         open(part, 'wb').write(r.content)
         os.replace(part, os.path.join(stage, name))
         print('downloaded %s/%s %d bytes sha256=%s%s' % (pkg, name, len(r.content),
-              digest[:16] + '...', ' (matches server)' if want_sha else ''))
+              digest[:16] + '...', note))
     verify(cfg, pkg, want, pin_arg, stage, vc, sorted(expect))
-    os.makedirs(outdir, exist_ok=True)
+    if os.path.isdir(final):
+        shutil.rmtree(stage)
+        print('v%s already pulled - staged copy discarded, existing files kept' % vc)
+    else:
+        os.replace(stage, final)  # one atomic rename: the set appears all at once
+        print('promoted %d file(s) to %s/' % (len(expect), os.path.relpath(final, DIR)))
+    # point the stable 'current' link at the newest version, atomically
+    link_tmp = os.path.join(outdir, '.current.tmp')
+    if os.path.lexists(link_tmp):
+        os.remove(link_tmp)
+    os.symlink('v%s' % vc, link_tmp)
+    os.replace(link_tmp, os.path.join(outdir, 'current'))
     for old_f in os.listdir(outdir):
-        if old_f.endswith('.apk') and old_f not in expect:
+        if old_f.endswith('.apk'):  # pre-versioning layout leftovers
             os.remove(os.path.join(outdir, old_f))
-    for name in expect:
-        os.replace(os.path.join(stage, name), os.path.join(outdir, name))
-    os.rmdir(stage)
-    print('finalized %d file(s) in %s/' % (len(expect), pkg))
+    print('ready: %s' % os.path.join(os.path.relpath(outdir, DIR), 'current') + '/')
 
 # ---- APK Signature Scheme v2/v3 verification (pure python) ----
-# apksigner is the reference implementation, but it needs a Java SDK; this
-# mirrors the v2/v3 spec: parse the APK Signing Block, verify each signer's
-# signature over the signed data, then verify the content digest over the APK
-# sections. Any failure aborts the pull - an unverifiable file is never kept.
+# Mirrors Android's apksig (ApkSigningBlockUtils + V2/V3SchemeVerifier), not a
+# guess from samples: EOCD must end exactly at EOF, the digested EOCD section
+# includes the full comment, per-record length prefixes, ordered sig/digest
+# algorithm-list equality, signer/signedData SDK range agreement (v3), and v3
+# preferred over v2. Cross-checked against the reference apksigner jar.
 from cryptography import x509 as _x509
 from cryptography.hazmat.primitives.asymmetric import rsa, ec, dsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
@@ -378,71 +399,58 @@ _SIG_DIGEST = {0x0101: 1, 0x0103: 1, 0x0201: 1, 0x0301: 1,
 _DIGEST_FN = {1: hashlib.sha256, 2: hashlib.sha512}
 _SIG_V2_ID = 0x7109871A
 _SIG_V3_ID = 0xF05368C0
+_SIG_V31_ID = 0x1B93AD61
+_STRIPPING_PROTECTION_ATTR_ID = 0xBEEFF00D
 
 def _lp(buf, off):
     ln = struct.unpack_from('<I', buf, off)[0]
+    if ln > len(buf) - off - 4:
+        raise PullError('verify', 'malformed length-prefixed value in signature block')
     return buf[off + 4:off + 4 + ln], off + 4 + ln
 
-def _lp_seq(buf):
-    """List of length-prefixed items from a sequence field. On disk these fields
-    carry their own total-length prefix (uint32 == len(buf) - 4); accept the raw
-    concatenation form too."""
-    if len(buf) >= 4 and struct.unpack_from('<I', buf, 0)[0] == len(buf) - 4:
-        buf = buf[4:]
+def _id_value_seq(buf):
+    """AOSP parseIdValues: concatenated records, each lp(u32 id + lp value)."""
     items, off = [], 0
     while off < len(buf):
-        item, off = _lp(buf, off)
-        items.append(item)
-    if off != len(buf):
-        raise PullError('verify', 'malformed length-prefixed sequence in signature block')
-    return items
-
-def _algo_seq(buf):
-    """List of (algo_id, value) from a wrapped sequence of uint32 algo + lp value."""
-    if len(buf) >= 4 and struct.unpack_from('<I', buf, 0)[0] == len(buf) - 4:
-        buf = buf[4:]
-    items, off = [], 0
-    while off < len(buf):
-        algo = struct.unpack_from('<I', buf, off)[0]
-        val, off = _lp(buf, off + 4)
+        rec, off = _lp(buf, off)
+        if len(rec) < 4:
+            raise PullError('verify', 'malformed record in signature block')
+        algo = struct.unpack_from('<I', rec, 0)[0]
+        val, voff = _lp(rec, 4)
+        if voff != len(rec):
+            raise PullError('verify', 'malformed record in signature block')
         items.append((algo, val))
-    if off != len(buf):
-        raise PullError('verify', 'malformed algo sequence in signature block')
     return items
 
-def _certs_seq(buf):
-    """Certificates field -> list of DER certs. Observed on disk: uint32 total
-    length, then DER blobs back-to-back (each self-delimiting). Tolerates the
-    lp-item framing as well."""
-    if len(buf) >= 4 and struct.unpack_from('<I', buf, 0)[0] == len(buf) - 4:
-        buf = buf[4:]
+def _cert_seq(buf):
+    """AOSP: concatenated lp(DER cert)."""
     certs, off = [], 0
     while off < len(buf):
-        if buf[off] != 0x30:
-            # maybe lp framing: uint32 length + DER
-            lp_len = struct.unpack_from('<I', buf, off)[0]
-            if 0 < lp_len <= len(buf) - off - 4 and buf[off + 4] == 0x30:
-                off += 4
-            else:
-                raise PullError('verify', 'malformed certificates in signature block')
-        if buf[off + 1] & 0x80:
-            n = buf[off + 1] & 0x7F
-            ln = int.from_bytes(buf[off + 2:off + 2 + n], 'big')
-            total = 2 + n + ln
-        else:
-            total = 2 + buf[off + 1]
-        certs.append(buf[off:off + total])
-        off += total
-    if off != len(buf) or not certs:
-        raise PullError('verify', 'malformed certificates in signature block')
+        c, off = _lp(buf, off)
+        certs.append(c)
+    if not certs:
+        raise PullError('verify', 'signature block has no certificates')
     return certs
+
+def _find_eocd(data):
+    """AOSP ZipUtils: a candidate EOCD is valid only if its comment length makes
+    the record end EXACTLY at end of file - anything appended after the record
+    (or a corrupted comment length) means no EOCD at all."""
+    pos = max(0, len(data) - (22 + 65535))
+    while True:
+        i = data.find(b'PK\x05\x06', pos)
+        if i < 0 or i + 22 > len(data):
+            raise PullError('verify', 'no ZIP end-of-central-directory record ending at EOF - '
+                            'not a zip, or bytes were appended after it')
+        clen = struct.unpack_from('<H', data, i + 20)[0]
+        if i + 22 + clen == len(data):
+            return i
+        pos = i + 1
 
 def _sig_block(data):
     """-> (pairs dict, block_start, eocd_off, cd_off); raises if no signing block."""
-    i = data.rfind(b'PK\x05\x06', max(0, len(data) - 66000))
-    if i < 0:
-        raise PullError('verify', 'not a zip archive (no end-of-central-directory)')
-    cd_off = struct.unpack_from('<I', data, i + 16)[0]
+    eocd_off = _find_eocd(data)
+    cd_off = struct.unpack_from('<I', data, eocd_off + 16)[0]
     if data[cd_off - 16:cd_off] != b'APK Sig Block 42':
         raise PullError('verify', 'no APK Signing Block - not v2/v3 signed; v1-only files are rejected')
     size2 = struct.unpack_from('<Q', data, cd_off - 24)[0]
@@ -455,21 +463,29 @@ def _sig_block(data):
         pid = struct.unpack_from('<I', data, off + 8)[0]
         pairs[pid] = data[off + 12:off + 8 + ln]
         off += 8 + ln
-    return pairs, block_start, i, cd_off
+    return pairs, block_start, eocd_off, cd_off
 
 def _content_digest(data, block_start, eocd_off, cd_off, hashfn):
-    eocd = bytearray(data[eocd_off:eocd_off + 22])
-    eocd[16:20] = struct.pack('<I', block_start)  # CD offset points at sig block
-    ranges = [(0, block_start), (cd_off, eocd_off), (eocd_off, eocd_off + 22)]
+    """Digest over the three zip sections; the EOCD section is the FULL record
+    (including any zip comment) with the central-directory offset patched to
+    point at the signing block, exactly as apksig digests it."""
+    eocd = bytearray(data[eocd_off:])
+    eocd[16:20] = struct.pack('<I', block_start)
+    ranges = [(0, block_start), (cd_off, eocd_off)]
     chunks = []
     for a, b in ranges:
         j = a
         while j < b:
-            piece = data[j:min(j + 1048576, b)] if (a, b) != ranges[2] else bytes(eocd)
+            piece = data[j:min(j + 1048576, b)]
             h = hashfn()
             h.update(b'\xa5' + struct.pack('<I', len(piece)) + piece)
             chunks.append(h.digest())
             j += 1048576
+    for j in range(0, len(eocd), 1048576):
+        piece = bytes(eocd[j:j + 1048576])
+        h = hashfn()
+        h.update(b'\xa5' + struct.pack('<I', len(piece)) + piece)
+        chunks.append(h.digest())
     h = hashfn()
     h.update(b'\x5a' + struct.pack('<I', len(chunks)) + b''.join(chunks))
     return h.digest()
@@ -490,85 +506,130 @@ def _verify_one_sig(algo, public_key, sig, signed_data):
     else:
         raise InvalidSignature('unsupported algo 0x%04x' % algo)
 
+def _parse_signer_v2(s):
+    sd, o = _lp(s, 0)
+    sigs, o = _lp(s, o)
+    pk, o = _lp(s, o)
+    dig, o2 = _lp(sd, 0)
+    certs_b, o2 = _lp(sd, o2)
+    attrs_b, o2 = _lp(sd, o2)
+    return sd, sigs, pk, dig, certs_b, attrs_b, None, None
+
+def _parse_signer_v3(s):
+    sd, o = _lp(s, 0)
+    sdk_min = struct.unpack_from('<I', s, o)[0]
+    sdk_max = struct.unpack_from('<I', s, o + 4)[0]
+    o += 8
+    sigs, o = _lp(s, o)
+    pk, o = _lp(s, o)
+    dig, o2 = _lp(sd, 0)
+    certs_b, o2 = _lp(sd, o2)
+    sd_min = struct.unpack_from('<I', sd, o2)[0]
+    sd_max = struct.unpack_from('<I', sd, o2 + 4)[0]
+    o2 += 8
+    attrs_b, o2 = _lp(sd, o2)
+    # AOSP V3_SIG_*_SDK_VERSION_MISMATCH_BETWEEN_SIGNER_AND_SIGNED_DATA_RECORD
+    if sdk_min != sd_min or sdk_max != sd_max:
+        raise PullError('verify', 'v3 SDK range in signer (%s-%s) disagrees with signed data '
+                        '(%s-%s)' % (sdk_min, sdk_max, sd_min, sd_max))
+    if sdk_min > sdk_max:
+        raise PullError('verify', 'v3 SDK range invalid (min %s > max %s)' % (sdk_min, sdk_max))
+    return sd, sigs, pk, dig, certs_b, attrs_b, sdk_min, sdk_max
+
 def _verify_scheme(data, block, ver, block_start, eocd_off, cd_off):
-    # signers field: one length prefix around the whole sequence, then lp signers.
-    # (No auto-detect here: with a single signer the signer's own length equals
-    # len-4, which would fool the heuristic used for the inner fields.)
+    # signers: lp(sequence) then lp(signer) per signer (AOSP parseSigners)
     seq, consumed = _lp(block, 0)
     if consumed != len(block):
-        seq = block
+        raise PullError('verify', 'malformed signers sequence in signature block')
     signers, off = [], 0
     while off < len(seq):
         st, off = _lp(seq, off)
         signers.append(st)
     if not signers:
         raise PullError('verify', 'signature block has no signers')
+    parse = _parse_signer_v2 if ver == 2 else _parse_signer_v3
     first_fp, first_subj = None, None
+    referenced_schemes = set()
     for s in signers:
-        ok = False
-        digest_mismatch = False
-        for v3_layout in ((False, True) if ver == 3 else (False,)):
-            try:
-                sd, o = _lp(s, 0)
-                if v3_layout:
-                    o += 8  # v3: minSDK + maxSDK uint32 between signed data and signatures
-                sigs, o = _lp(s, o)
-                pk, o = _lp(s, o)
-                dig, o2 = _lp(sd, 0)
-                certs_b, o2 = _lp(sd, o2)
-                # digests/signatures: wrapped sequences of (uint32 sig-algo id +
-                # lp value); digest entries are keyed by the SIGNATURE algo id.
-                digests = dict(_algo_seq(dig))
-                # certificates: wrapped sequence of DER blobs (each self-delimiting
-                # via its DER length); tolerate lp-item framing too.
-                certs = _certs_seq(certs_b)
-                cert = _x509.load_der_x509_certificate(certs[0])
-                pubkey = cert.public_key()
-                if pubkey.public_bytes(serialization.Encoding.DER,
-                                       serialization.PublicFormat.SubjectPublicKeyInfo) != pk:
-                    continue  # signer-record public key must match the certificate
-                verified_algo = None
-                for algo, sig in _algo_seq(sigs):
-                    if algo not in _SIG_ALGOS:
-                        continue
-                    try:
-                        _verify_one_sig(algo, pubkey, sig, sd)
-                        verified_algo = algo
-                        break
-                    except InvalidSignature:
-                        continue
-                if verified_algo is None or verified_algo not in digests:
-                    continue
-                computed = _content_digest(data, block_start, eocd_off, cd_off,
-                                           _DIGEST_FN[_SIG_DIGEST[verified_algo]])
-                if computed != digests[verified_algo]:
-                    digest_mismatch = True
-                    continue
-                ok = True
-                break
-            except (struct.error, IndexError, ValueError):
+        sd, sigs, pk, dig, certs_b, attrs_b, sdk_min, sdk_max = parse(s)
+        signatures = _id_value_seq(sigs)
+        digests = _id_value_seq(dig)
+        if not signatures:
+            raise PullError('verify', 'no signatures in signer record')
+        # AOSP: the ordered algorithm lists of the signatures and digests
+        # records must agree exactly.
+        if [a for a, _ in signatures] != [a for a, _ in digests]:
+            raise PullError('verify', 'signature algorithm IDs do not match between '
+                            'signatures and digests records')
+        certs = _cert_seq(certs_b)
+        try:
+            cert = _x509.load_der_x509_certificate(certs[0])
+        except ValueError:
+            raise PullError('verify', 'malformed signing certificate')
+        pubkey = cert.public_key()
+        if pubkey.public_bytes(serialization.Encoding.DER,
+                               serialization.PublicFormat.SubjectPublicKeyInfo) != pk:
+            raise PullError('verify', 'public key mismatch between certificate and signatures record')
+        # verify signatures; unknown algorithms are skipped with a warning (AOSP
+        # behavior), at least one supported signature must verify.
+        verified_algos = []
+        for algo, sig in signatures:
+            if algo not in _SIG_ALGOS:
+                print('verify warning: unknown signature algorithm 0x%04x - skipped' % algo)
                 continue
-        if digest_mismatch:
-            raise PullError('verify', 'CONTENT DIGEST MISMATCH - file was modified after signing')
-        if not ok:
-            raise PullError('verify', 'v%d signature does not verify' % ver)
+            try:
+                _verify_one_sig(algo, pubkey, sig, sd)
+                verified_algos.append(algo)
+            except InvalidSignature:
+                raise PullError('verify', 'v%d signature (algo 0x%04x) DID NOT VERIFY' % (ver, algo))
+        if not verified_algos:
+            raise PullError('verify', 'no supported v%d signatures' % ver)
+        # content digest must match for every verified signature's algorithm
+        for algo in verified_algos:
+            stored = dict(digests)[algo]
+            computed = _content_digest(data, block_start, eocd_off, cd_off,
+                                       _DIGEST_FN[_SIG_DIGEST[algo]])
+            if computed != stored:
+                raise PullError('verify', 'CONTENT DIGEST MISMATCH - file was modified after signing')
+        # stripping-protection attribute: ids of newer schemes this file claims
+        # to also be signed with (AOSP: referenced scheme must be present)
+        aoff = 0
+        while aoff < len(attrs_b):
+            attr, aoff = _lp(attrs_b, aoff)
+            if len(attr) >= 4 and struct.unpack_from('<I', attr, 0)[0] == _STRIPPING_PROTECTION_ATTR_ID:
+                if len(attr) >= 8:
+                    referenced_schemes.add(struct.unpack_from('<I', attr, 4)[0])
         fp = hashlib.sha256(certs[0]).hexdigest().upper()
         if first_fp is None:
             first_fp = fp
             first_subj = cert.subject.rfc4514_string()
         elif fp != first_fp:
             raise PullError('verify', 'multiple signers with different certificates')
-    return first_fp, first_subj
+    return first_fp, first_subj, referenced_schemes
 
 def apk_verify_signature(path):
-    """Cryptographically verify the APK's v2/v3 signature and content digest.
-    Returns (signer cert sha256 hex, subject). Raises PullError on any failure."""
+    """Cryptographically verify the APK's signature and content digest, mirroring
+    apksig. Prefers v3 over v2 when both exist (AOSP order). Returns
+    (signer cert sha256 hex, subject). Raises PullError on any failure."""
     data = open(path, 'rb').read()
     pairs, block_start, eocd_off, cd_off = _sig_block(data)
-    if _SIG_V2_ID in pairs:
-        return _verify_scheme(data, pairs[_SIG_V2_ID], 2, block_start, eocd_off, cd_off)
+    def _check_refs(refs, ver):
+        missing = {i for i in refs if i in (_SIG_V2_ID, _SIG_V3_ID, _SIG_V31_ID)} - set(pairs)
+        if missing:
+            raise PullError('verify', 'v%d block claims the file is also signed with scheme(s) %s '
+                            'but those blocks are missing - the file was tampered with'
+                            % (ver, ['0x%08x' % i for i in sorted(missing)]))
     if _SIG_V3_ID in pairs:
-        return _verify_scheme(data, pairs[_SIG_V3_ID], 3, block_start, eocd_off, cd_off)
+        fp, subj, refs = _verify_scheme(data, pairs[_SIG_V3_ID], 3, block_start, eocd_off, cd_off)
+        _check_refs(refs, 3)
+        return fp, subj
+    if _SIG_V2_ID in pairs:
+        fp, subj, refs = _verify_scheme(data, pairs[_SIG_V2_ID], 2, block_start, eocd_off, cd_off)
+        _check_refs(refs, 2)
+        return fp, subj
+    if _SIG_V31_ID in pairs:
+        raise PullError('verify', 'only a v3.1 (key rotation) signature is present - '
+                        'lineage verification is not implemented; refusing the file')
     raise PullError('verify', 'APK has no v2/v3 signature')
 
 def apk_manifest(apk_path):
@@ -642,7 +703,7 @@ def cmd_selfcheck():
     print('  [ok] device registered (gsf_id present)')
     try:
         api = build_api(cfg)
-        get_details(api, 'com.android.vending')
+        get_details(api, 'com.google.android.calculator')
         print('  [ok] FDFE details works - pipeline healthy')
     except PullError as e:
         print('  [FAIL] fdfe: %s\n         fix: %s' % (e, e.remedy)); sys.exit(1)

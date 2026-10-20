@@ -20,23 +20,35 @@ python3 pull.py pull com.google.android.calculator 9.3 --pin-sha256 <sha256 from
 python3 pull.py selfcheck                       # stage-by-stage health check
 ```
 
-Downloads land in `./<package>/` (base.apk + split_*.apk).
+Downloads land in `./<package>/v<versionCode>/` (base.apk + split_*.apk), promoted
+there in one atomic rename after all checks pass; `./<package>/current` is a symlink
+to the latest version. A re-pull of an already-pulled version keeps the existing files.
 
 ## Trust model
 
-Every downloaded file is verified before it reaches `./<package>/`:
+Every downloaded file is verified before it reaches `./<package>/v<versionCode>/`:
 
 - the sha256 of each file is checked against the hash Play's delivery response
-  carries for it;
+  carries for it. Play sometimes omits the hash for a file: a loud warning is
+  printed per file (set `strict_hashes: true` in config.json to fail instead);
 - each split's APK Signature Scheme v2/v3 block is cryptographically verified in
-  pure python (signature over the signed data plus the content digest over the
-  whole file - a modified or truncated APK fails, v1-only files are rejected);
+  pure python, mirroring Android's apksig: signature over the signed data plus the
+  content digest over the whole file, EOCD must end exactly at EOF, zip comments
+  are covered by the digest, the signatures/digests algorithm lists must match,
+  v3 inner/outer SDK ranges must agree, and v3 is preferred over v2. A modified,
+  truncated, or appended-to APK fails; v1-only files are rejected. Cross-checked
+  against the reference apksigner on crafted fixtures. v3.1-only files (key
+  rotation lineage) are refused; files carrying v3.1 alongside v3/v2 verify via
+  the v3/v2 block, so on key-rotated apps the reported signer is the pre-rotation
+  certificate (stable across pulls); a stripped scheme block is detected via the
+  stripping-protection attribute;
 - all splits must be signed by the SAME certificate;
 - the base APK's package name must equal the request and its versionCode must
   equal the versionCode Play said it would serve;
-- downloads stage into `./<package>/.staging-<versionCode>/` and only move into
-  the package dir after every check passes, so a failed pull can never leave a
-  mix of old and new files or clobber a previously verified set.
+- downloads stage into a scratch dir inside the package dir and are promoted to
+  the immutable `./<package>/v<versionCode>/` in ONE atomic rename after every
+  check passes, so a failed pull can never leave a mix of old and new files or
+  clobber a previously verified set.
 
 On top of that you choose per app:
 
