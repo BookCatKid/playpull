@@ -52,8 +52,12 @@ the developer's certificate; a re-signed stub does not.
    `Content-Type: application/x-protobuffer` or the server answers HTTP 400.
 3. **Pulling** (`check`/`pull`): exchanges the AAS for a token scoped
    `oauth2:https://www.googleapis.com/auth/googleplay` (app com.android.vending),
-   then FDFE `details` -> `purchase` (free acquire; paid apps are refused before
-   any purchase call) -> `delivery` -> download of every split -> verification.
+   then FDFE `details` -> `acquire` -> `purchase` -> `delivery` -> download of
+   every split -> verification. The `acquire` step (protobuf POST) is the modern
+   first-time-acquisition ceremony: without it, the plain form-encoded `purchase`
+   is rejected with DF-DFERH-01 for never-owned apps in some categories (measured
+   on Mature 17+ titles); already-owned apps skip it. Paid apps are refused
+   before any purchase call.
 
 ## What actually matters (measured, Oct 2026)
 
@@ -76,7 +80,7 @@ UA and profile stay current in config.json as cheap insurance; bump
 | `device: device id rejected (DF-DFERH-01)` or empty catalog | registration pruned after long inactivity | remove gsf_id/security_token from config.json, then `python3 pull.py init` |
 | `fdfe: server 5xx` / network errors | transient | automatic retries (3x backoff); just rerun |
 | `no details for ...` / `Item not found` | package typo, delisted app, region lock, device filter (sdk too old), or the staged rollout has not reached this cohort | check the id; cohorts lag, retry later |
-| purchase `DF-DFERH-01` on a specific app while others pull fine | account not eligible: measured on Mature 17+ rated apps with an account that has no verified age (also developer acquisition restrictions) | use an account with verified age; not client-fixable |
+| purchase `DF-DFERH-01` on a specific app while others pull fine | genuine server-side refusal (the acquire ceremony already ran): developer acquisition restriction, region, or account standing | try the app in the real Play Store on the same account; whatever error it shows is the answer |
 | everything else stale | Google bumped minimum client | bump `finsky.*` in config.json |
 
 `check`/`pull` auto-refresh the checkin once a day, keeping the registration alive.

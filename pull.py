@@ -178,6 +178,45 @@ def build_api(cfg):
     api.setAuthSubToken(tok)
     return api
 
+def _varint(n):
+    out = b''
+    while True:
+        b = n & 0x7F; n >>= 7
+        out += bytes([b | 0x80]) if n else bytes([b])
+        if not n:
+            return out
+
+def _field_varint(num, val):
+    return _varint(num << 3) + _varint(val)
+
+def _field_msg(num, body):
+    return _varint(num << 3 | 2) + _varint(len(body)) + body
+
+def build_acquire_request(pkg, vc, ot=1):
+    """Modern first-time acquisition ceremony (POST /fdfe/acquire, protobuf).
+    Layout mirrors what Finsky/Aurora send; field names per AcquireApp.proto."""
+    import base64
+    payload = _field_msg(1, pkg.encode()) + _field_varint(2, 1) + _field_varint(3, 3)
+    package = _field_msg(1, payload) + _field_varint(2, 1)
+    version = _field_varint(1, vc) + _field_varint(3, 0)
+    m30 = _field_varint(1, 2) + _field_varint(2, 0)
+    nonce = 'nonce=' + base64.urlsafe_b64encode(os.urandom(256)).decode().rstrip('=')
+    return (_field_msg(1, package) + _field_msg(12, version) + _field_varint(13, ot) +
+            _field_varint(15, 0) + _field_msg(22, nonce.encode()) + _field_varint(25, 2) +
+            _field_msg(30, m30))
+
+def acquire(api, pkg, vc, ot=1):
+    """Best-effort first-time acquisition. Without this, the plain purchase call is
+    rejected (DF-DFERH-01) for never-owned apps in some categories (measured on
+    Mature 17+ titles); already-owned apps don't need it. Failures are ignored on
+    purpose - a later purchase error is the real signal."""
+    h = api.getHeaders()
+    h['Content-Type'] = 'application/x-protobuf'
+    try:
+        requests.post(FDFE + 'acquire', headers=h, data=build_acquire_request(pkg, vc, ot), timeout=30)
+    except requests.RequestException:
+        pass
+
 def parse_wrapper(resp):
     return googleplay_pb2.ResponseWrapper.FromString(resp.content)
 
@@ -226,6 +265,7 @@ def cmd_pull(cfg, pkg, want, pin_arg):
     if micros:
         raise PullError('fdfe', '%s is a paid app (%s %.2f). playpull only acquires free apps - '
                         'no purchase made' % (pkg, currency or '', micros / 1e6))
+    acquire(api, pkg, vc)
     h = api.getHeaders(); h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
     pr = _req('POST', FDFE + 'purchase', h, data={'ot': '1', 'doc': pkg, 'vc': str(vc)}, stage='fdfe')
     pmsg = parse_wrapper(pr)
@@ -234,9 +274,9 @@ def cmd_pull(cfg, pkg, want, pin_arg):
         err = pmsg.commands.displayErrorMessage or 'none'
         hint = ''
         if 'DF-DFERH-01' in err:
-            hint = (' For a specific app (while others pull fine) this usually means the account '
-                    'is not eligible for it - typical causes: age-restricted rating (17+/18+) on an '
-                    'account without verified age, or a developer-side acquisition restriction.')
+            hint = (' The acquire ceremony already ran, so this is a genuine server-side refusal: '
+                    'the account is not eligible for this app (developer acquisition restriction, '
+                    'region, or account standing).')
         raise PullError('fdfe', 'purchase returned no download token (err=%s).%s' % (err, hint))
     dl = _req('GET', FDFE + 'delivery', h, params={'doc': pkg, 'vc': str(vc), 'ot': '1',
               'dtok': br.downloadToken}, stage='fdfe')
