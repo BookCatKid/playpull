@@ -318,7 +318,8 @@ def cmd_pull(cfg, pkg, want, pin_arg):
         if len(x) == 64 and all(c in '0123456789abcdefABCDEF' for c in x):
             return x.lower()
         try:
-            return base64.b64decode(x + '=' * (-len(x) % 4)).hex()
+            raw = base64.urlsafe_b64decode(x + '=' * (-len(x) % 4))  # Play uses base64url (-_); urlsafe also reads standard (+/)
+            return raw.hex() if len(raw) == 32 else ''
         except Exception:
             return 
 
