@@ -11,6 +11,17 @@ Commands:
                                --pin-sha256 HEX: require this signer certificate (saved to
                                config for next time). Without a pin the actual signer is
                                printed (trust on first use: re-run with --pin-sha256 to pin).
+                               --version-code N: pull an older build Play still hosts.
+                               --only-if-newer: skip everything when v<served vc> is on disk.
+                               --list FILE: bulk mode, one package per line (# = comment),
+                               per-app summary at the end.
+  versions PACKAGE             Enumerate which versionCodes Play still hosts (probes
+                               purchase+delivery grants, no downloads; finds the oldest
+                               hosted build by exponential step + binary search).
+                               --probe-all: verify every vc in the hosted range.
+  Global flags: --json (machine-readable result on stdout, progress on stderr),
+  --pace SECS (delay between network probes/apps; default 8 in bulk, 2 in versions),
+  --max-probes N (probe budget for versions; default 40).
   selfcheck                    Stage-by-stage health check with remedies for each failure.
   checkin                      Re-checkin with the stored device id (check/pull do this
                                automatically once a day).
@@ -41,9 +52,22 @@ class PullError(Exception):
     def __init__(self, stage, msg, remedy=None):
         super().__init__(msg); self.stage = stage; self.remedy = remedy
 
+_JSON_MODE = False
+_REAL_STDOUT = None
+RESULT = {}
+
+def emit_result():
+    if _JSON_MODE:
+        json.dump(RESULT, _REAL_STDOUT, indent=2, sort_keys=True)
+        _REAL_STDOUT.write('\n')
+
 def die(e):
     print('ERROR [%s] %s' % (e.stage, e), file=sys.stderr)
     if e.remedy: print('  fix: %s' % e.remedy, file=sys.stderr)
+    if _JSON_MODE:
+        json.dump({'error': e.stage, 'message': str(e), 'remedy': e.remedy or ''},
+                  _REAL_STDOUT, indent=2, sort_keys=True)
+        _REAL_STDOUT.write('\n')
     sys.exit(1)
 
 def load_config(require_device=True):
@@ -274,9 +298,10 @@ def cmd_check(cfg, pkg):
     maybe_refresh_checkin(cfg)
     _, vs, vc = get_details(api, pkg)
     print('served: %s (vc %s)' % (vs, vc))
+    RESULT.update({'package': pkg, 'version': vs, 'version_code': vc})
     return vs, vc
 
-def cmd_pull(cfg, pkg, want, pin_arg, vc_override=0):
+def cmd_pull(cfg, pkg, want, pin_arg, vc_override=0, only_if_newer=False):
     api = build_api(cfg)
     maybe_refresh_checkin(cfg)
     doc, vs, vc = get_details(api, pkg)
@@ -289,6 +314,13 @@ def cmd_pull(cfg, pkg, want, pin_arg, vc_override=0):
         vc = vc_override
     elif want and not vs.startswith(want):
         print('prefix %s not in served version - not pulling' % want); sys.exit(2)
+    if only_if_newer:
+        have = os.path.join(DIR, pkg, 'v%s' % vc)
+        if os.path.isdir(have) and os.listdir(have):
+            print('up to date: v%s already on disk - skipped' % vc)
+            RESULT.update({'package': pkg, 'version': vs, 'version_code': vc,
+                           'status': 'up-to-date'})
+            return 'up-to-date'
     micros, currency = offer_price(doc)
     if micros:
         raise PullError('fdfe', '%s is a paid app (%s %.2f). playpull only acquires free apps - '
@@ -345,6 +377,7 @@ def cmd_pull(cfg, pkg, want, pin_arg, vc_override=0):
     # clobber a previously verified set.
     final = os.path.join(outdir, 'v%s' % vc)
     stage = os.path.join(outdir, '.staging-%s-%s' % (vc, os.getpid()))
+    file_info = []
     if os.path.isdir(stage):
         shutil.rmtree(stage)
     os.makedirs(stage)
@@ -374,10 +407,14 @@ def cmd_pull(cfg, pkg, want, pin_arg, vc_override=0):
         os.replace(part, os.path.join(stage, name))
         print('downloaded %s/%s %d bytes sha256=%s%s' % (pkg, name, len(r.content),
               digest[:16] + '...', note))
-    verify(cfg, pkg, want, pin_arg, stage, vc, sorted(expect))
+        file_info.append({'name': name, 'bytes': len(r.content), 'sha256': digest,
+                          'server_hash_supplied': bool(want_sha)})
+    sig = verify(cfg, pkg, want, pin_arg, stage, vc, sorted(expect))
+    status = 'pulled'
     if os.path.isdir(final):
         shutil.rmtree(stage)
         print('v%s already pulled - staged copy discarded, existing files kept' % vc)
+        status = 'already-pulled'
     else:
         os.replace(stage, final)  # one atomic rename: the set appears all at once
         print('promoted %d file(s) to %s/' % (len(expect), os.path.relpath(final, DIR)))
@@ -391,6 +428,10 @@ def cmd_pull(cfg, pkg, want, pin_arg, vc_override=0):
         if old_f.endswith('.apk'):  # pre-versioning layout leftovers
             os.remove(os.path.join(outdir, old_f))
     print('ready: %s' % os.path.join(os.path.relpath(outdir, DIR), 'current') + '/')
+    RESULT.update({'package': pkg, 'version': (sig or {}).get('version_name') or vs,
+                   'version_code': int(vc), 'status': status, 'files': file_info,
+                   'dir': os.path.relpath(final, DIR), **(sig or {})})
+    return status
 
 # ---- APK Signature Scheme v2/v3 verification (pure python) ----
 # Mirrors Android's apksig (ApkSigningBlockUtils + V2/V3SchemeVerifier), not a
@@ -649,6 +690,7 @@ def apk_manifest(apk_path):
     return APK(apk_path)
 
 def verify(cfg, pkg, want, pin_arg, outdir, vc, files):
+    sig_out = {}
     # 1. cryptographic signature verification on EVERY split
     signers, subjects = {}, {}
     for name in files:
@@ -672,6 +714,7 @@ def verify(cfg, pkg, want, pin_arg, outdir, vc, files):
         raise PullError('verify', 'versionCode mismatch: APK has %s, Play served %s - '
                         'do NOT use these files' % (actual_vc, vc))
     print('verify version  OK (%s, vc %s)' % (a.get_androidversion_name(), actual_vc))
+    sig_out['version_name'] = a.get_androidversion_name()
     if want and not a.get_androidversion_name().startswith(want):
         raise PullError('verify', 'version mismatch: got %s, wanted prefix %s'
                         % (a.get_androidversion_name(), want))
@@ -687,11 +730,13 @@ def verify(cfg, pkg, want, pin_arg, outdir, vc, files):
             cfg.setdefault('pins', {})[pkg] = pin
             save_config(cfg)
         print('verify signer   OK (matches pinned certificate - authenticated)')
+        return {'signer_sha256': sha256, 'signer_subject': subj, 'pinned': True, **sig_out}
     else:
         print('verify signer   UNVERIFIED (TOFU) - signature is valid but the signer is not pinned:')
         print('                authenticity NOT established until you confirm this certificate')
         print('                out-of-band, then pin it:')
         print('                python3 pull.py pull %s %s --pin-sha256 %s' % (pkg, want or '', sha256))
+        return {'signer_sha256': sha256, 'signer_subject': subj, 'pinned': False, **sig_out}
 
 def cmd_selfcheck():
     print('playpull selfcheck')
@@ -721,38 +766,170 @@ def cmd_selfcheck():
         print('  [FAIL] fdfe: %s\n         fix: %s' % (e, e.remedy)); sys.exit(1)
     print('all checks passed')
 
+
+def _delivery_probe(api, pkg, vc):
+    """True when Play grants a delivery for this exact versionCode (no bytes are
+    downloaded). Measured: purchase grants a token for ANY vc, even ones that never
+    existed; the delivery step is where an unhosted vc is refused."""
+    h = api.getHeaders(); h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+    pr = _req('POST', FDFE + 'purchase', h, data={'ot': '1', 'doc': pkg, 'vc': str(vc)},
+              stage='fdfe')
+    br = parse_wrapper(pr).payload.buyResponse
+    if not br.downloadToken:
+        return False
+    dl = _req('GET', FDFE + 'delivery', h, params={'doc': pkg, 'vc': str(vc), 'ot': '1',
+              'dtok': br.downloadToken}, stage='fdfe')
+    return bool(parse_wrapper(dl).payload.deliveryResponse.appDeliveryData.downloadUrl)
+
+def cmd_versions(cfg, pkg, probe_all=False, max_probes=40, pace=2.0):
+    api = build_api(cfg)
+    maybe_refresh_checkin(cfg)
+    doc, vs, vc_hi = get_details(api, pkg)
+    micros, currency = offer_price(doc)
+    if micros:
+        raise PullError('fdfe', '%s is a paid app - probing would need a purchase; refused'
+                        % pkg)
+    acquire(api, pkg, vc_hi)
+    state = {'n': 0}
+    def hosted(vc):
+        state['n'] += 1
+        if state['n'] > max_probes:
+            raise PullError('fdfe', 'probe budget exhausted (%d) - rerun with a higher '
+                            '--max-probes or a narrower question' % max_probes)
+        ok = _delivery_probe(api, pkg, vc)
+        print('probe vc %-12s %s' % (vc, 'HOSTED' if ok else 'not hosted'))
+        time.sleep(pace)
+        return ok
+    print('current: %s (vc %s) - probing what else Play still hosts' % (vs, vc_hi))
+    if not hosted(vc_hi):
+        raise PullError('fdfe', 'the CURRENT versionCode %s is not delivered to this '
+                        'device/profile - enumeration is meaningless here' % vc_hi)
+    # exponential step down from the current vc, then binary search the boundary.
+    # Inference, not a guarantee: Play prunes by age, so the hosted set should be a
+    # contiguous suffix of versionCodes; --probe-all verifies that for a given range.
+    good, bad, step = vc_hi, None, 1
+    while good > 1 and bad is None:
+        cand = max(1, good - step)
+        if hosted(cand):
+            good = cand
+            step *= 2
+        else:
+            bad = cand
+    while bad is not None and bad + 1 < good:
+        mid = (bad + good) // 2
+        if hosted(mid):
+            good = mid
+        else:
+            bad = mid
+    lo = good
+    gaps = []
+    if probe_all:
+        span = vc_hi - lo + 1
+        if state['n'] + span > max_probes:
+            raise PullError('fdfe', '--probe-all needs %d more probes, over the %d budget - '
+                            'raise --max-probes' % (span, max_probes))
+        for vc in range(lo, vc_hi + 1):
+            if not hosted(vc):
+                gaps.append(vc)
+    print('hosted: vc %d..%d (%d builds%s), %d probes used'
+          % (lo, vc_hi, vc_hi - lo + 1,
+             ', gaps at %s' % gaps if gaps else '', state['n']))
+    RESULT.update({'package': pkg, 'current_version': vs, 'current_version_code': vc_hi,
+                   'hosted_min': lo, 'hosted_max': vc_hi, 'hosted_span': vc_hi - lo + 1,
+                   'unhosted_gaps': gaps, 'probe_all': probe_all, 'probes': state['n'],
+                   'note': 'suffix shape is inferred from pruning order unless probe_all '
+                           'verified every versionCode'})
+
 USAGE = __doc__
+
+def _take_flag(argv, name):
+    """Remove a boolean flag; return True when present."""
+    if name in argv:
+        argv.remove(name)
+        return True
+    return False
+
+def _take_value(argv, name, conv=str, what='a value'):
+    """Remove a --flag VALUE pair; return the converted value or None."""
+    if name not in argv:
+        return None
+    i = argv.index(name)
+    try:
+        v = conv(argv[i + 1])
+    except (IndexError, ValueError):
+        print('%s needs %s' % (name, what)); sys.exit(2)
+    del argv[i:i + 2]
+    return v
+
 if __name__ == '__main__':
     argv = sys.argv[1:]
-    pin = None
-    if '--pin-sha256' in argv:
-        i = argv.index('--pin-sha256')
-        try:
-            pin = argv[i + 1]
-        except IndexError:
-            print('--pin-sha256 needs a hex value'); sys.exit(2)
-        del argv[i:i + 2]
-    vc_override = 0
-    if '--version-code' in argv:
-        i = argv.index('--version-code')
-        try:
-            vc_override = int(argv[i + 1])
-            if vc_override <= 0: raise ValueError
-        except (IndexError, ValueError):
-            print('--version-code needs a positive integer'); sys.exit(2)
-        del argv[i:i + 2]
+    pin = _take_value(argv, '--pin-sha256', str, 'a hex value')
+    vc_override = _take_value(argv, '--version-code', int, 'a positive integer') or 0
+    if vc_override < 0:
+        print('--version-code needs a positive integer'); sys.exit(2)
+    list_file = _take_value(argv, '--list', str, 'a file path')
+    max_probes = _take_value(argv, '--max-probes', int, 'an integer') or 40
+    pace = _take_value(argv, '--pace', float, 'seconds')
+    json_mode = _take_flag(argv, '--json')
+    only_if_newer = _take_flag(argv, '--only-if-newer')
+    probe_all = _take_flag(argv, '--probe-all')
+    if json_mode:
+        _JSON_MODE = True
+        _REAL_STDOUT = sys.stdout
+        sys.stdout = sys.stderr  # progress/chatter to stderr; stdout carries only JSON
     cmd = argv[0] if argv else 'check'
     try:
         if cmd == 'init':
             cmd_init(load_config(require_device=False))
         elif cmd == 'check':
             if len(argv) < 2:
-                print('usage: pull.py check PACKAGE'); sys.exit(2)
+                print('usage: pull.py check PACKAGE [--json]'); sys.exit(2)
             cmd_check(load_config(), argv[1])
         elif cmd == 'pull':
+            if list_file:
+                if pin:
+                    print('--pin-sha256 with --list would pin every app to the same '
+                          'certificate - refused'); sys.exit(2)
+                pkgs = [l.split('#')[0].strip() for l in open(list_file)]
+                pkgs = [p for p in pkgs if p]
+                cfg = load_config()
+                results = []
+                app_pace = 8.0 if pace is None else pace
+                for n, p in enumerate(pkgs, 1):
+                    print('=== [%d/%d] %s' % (n, len(pkgs), p))
+                    RESULT.clear()
+                    try:
+                        cmd_pull(cfg, p, '', None, vc_override, only_if_newer)
+                        r = dict(RESULT)
+                    except PullError as e:
+                        print('ERROR [%s] %s' % (e.stage, e), file=sys.stderr)
+                        r = {'package': p, 'status': 'error', 'stage': e.stage,
+                             'message': str(e)}
+                    r.setdefault('package', p)
+                    results.append(r)
+                    if n < len(pkgs):
+                        time.sleep(app_pace)
+                ok = sum(1 for r in results if r.get('status') != 'error')
+                print('=== bulk: %d/%d ok' % (ok, len(results)))
+                for r in results:
+                    print('  %-40s %s' % (r['package'], r.get('status')))
+                RESULT.clear(); RESULT['results'] = results
+                if ok < len(results):
+                    emit_result()
+                    sys.exit(1)
+            else:
+                if len(argv) < 2:
+                    print('usage: pull.py pull PACKAGE [VERSION_PREFIX] [--pin-sha256 HEX] '
+                          '[--version-code N] [--only-if-newer] [--list FILE] [--json]')
+                    sys.exit(2)
+                cmd_pull(load_config(), argv[1], argv[2] if len(argv) > 2 else '', pin,
+                         vc_override, only_if_newer)
+        elif cmd == 'versions':
             if len(argv) < 2:
-                print('usage: pull.py pull PACKAGE [VERSION_PREFIX] [--pin-sha256 HEX] [--version-code N]'); sys.exit(2)
-            cmd_pull(load_config(), argv[1], argv[2] if len(argv) > 2 else '', pin, vc_override)
+                print('usage: pull.py versions PACKAGE [--probe-all] [--max-probes N] '
+                      '[--pace SECS] [--json]'); sys.exit(2)
+            cmd_versions(load_config(), argv[1], probe_all, max_probes,
+                         2.0 if pace is None else pace)
         elif cmd == 'selfcheck':
             cmd_selfcheck()
         elif cmd == 'checkin':
@@ -763,3 +940,4 @@ if __name__ == '__main__':
             print(USAGE)
     except PullError as e:
         die(e)
+    emit_result()

@@ -55,6 +55,31 @@ how far back the catalog reaches is per app - Play prunes. The verifier still
 requires the downloaded APK's versionCode to equal the requested one, so a wrong
 or substituted build is rejected.
 
+## Bulk, updates, automation
+
+```
+python3 pull.py pull --list apps.txt --only-if-newer   # one package per line, # comments
+python3 pull.py check com.termux --json                # machine-readable stdout
+python3 pull.py versions net.sourceforge.opencamera    # which versionCodes Play still hosts
+```
+
+- `--list FILE` pulls each package with pacing between apps (default 8s,
+  `--pace SECS`), never stops on a failure, and ends with a per-app summary;
+  exit code is 1 when any app failed. Combine with `--only-if-newer` to skip
+  apps whose served version is already on disk - the nightly-update pattern.
+- `--json` puts one machine-readable result on stdout (version, versionCode,
+  per-file sha256/bytes, signer fingerprint, pin status; one object per app in
+  bulk mode) and keeps all progress chatter on stderr. Errors are JSON too.
+- `versions PACKAGE` enumerates the hosted versionCode range without
+  downloading a single byte: it probes purchase+delivery grants (the delivery
+  step is where Play refuses an unhosted vc; purchase alone grants a token for
+  anything), stepping down exponentially from the current vc and then
+  binary-searching the floor. Measured: Open Camera hosts vc 42..96 (55
+  builds), found in 12 probes. Pruning is by age, so the hosted set is
+  normally a contiguous suffix - normally, not always: Termux hosts 126..142
+  but with real gaps at 128, 132, 133. `--probe-all` verifies every vc in the
+  range (costs one probe per vc; `--max-probes N` caps the budget, default 40).
+
 ## Trust model
 
 Every downloaded file is verified before it reaches `./<package>/v<versionCode>/`:
