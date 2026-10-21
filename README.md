@@ -10,15 +10,33 @@ mirrors. Works for any free app.
 ```
 pip install gpsoauth googleplay-api androguard cryptography playwright requests
 python3 -m playwright install chromium
-cp config.example.json config.json   # fill in email; leave the rest as shipped
 
-xvfb-run -a python3 mint_aas.py                 # one-time: browser sign-in (password + 2SV)
+xvfb-run -a python3 mint_aas.py                 # one-time: browser sign-in (password + 2SV); creates config.json
 python3 pull.py init                            # one-time: register a fresh device identity
 python3 pull.py check com.google.android.calculator
 python3 pull.py pull com.google.android.calculator            # TOFU: prints the signer
 python3 pull.py pull com.google.android.calculator 9.3 --pin-sha256 <sha256 from the TOFU print>
 python3 pull.py selfcheck                       # stage-by-stage health check
 ```
+
+## Config: nothing to edit
+
+You never hand-edit config.json. `mint_aas.py` creates it from the shipped
+defaults plus the email you sign in with; `pull.py init` fills in the device
+registration. Everything below is automatic:
+
+| Field | Filled by | When |
+| --- | --- | --- |
+| `email` | `mint_aas.py` | at sign-in |
+| `aas_token` (file) | `mint_aas.py` | at sign-in |
+| `gsf_id`, `security_token` | `pull.py init` | device registration |
+| `consistency_token`, `digest`, `last_checkin` | checkin refresh | automatically, ~daily |
+| `device.*` (Pixel 9a profile) | shipped defaults | leave alone (see below) |
+| `finsky.*` | shipped defaults | bump only if Google enforces a newer client |
+
+The only optional edits: `pins` (per-app signer pins, also set via
+`--pin-sha256`), and `strict_hashes: true` to hard-fail when Play omits a
+download hash. `config.example.json` is the reference for the defaults.
 
 Downloads land in `./<package>/v<versionCode>/` (base.apk + split_*.apk), promoted
 there in one atomic rename after all checks pass; `./<package>/current` is a symlink
@@ -92,12 +110,19 @@ Required: a valid AAS token; the googleplay-scope token (legacy `service=android
 gives 401 DF-DFERH-01); a registered GSF id in the `X-DFE-Device-Id` header (absent
 gives 400; an unknown id gives a silently empty store).
 
+Enforced (measured): the device profile in the checkin/uploadDeviceConfig
+DeviceConfigurationProto. Play compatibility-filters the catalog against the
+declared SDK, ABIs, screen, system features, shared libraries, locales and GL
+version/extensions: with a 2015-era profile (the gpapi built-in), apps like
+Wikipedia come back `availability: device-incompatible` and cannot be pulled.
+The shipped config declares a full modern profile (Pixel 9a, Android 15) and
+init uploads it; with it, everything Play serves to a current device is served.
+
 NOT required (each verified by removing it): the Finsky User-Agent version (a 2017
-"Android-Finsky/8.4.19" works; even a fake "99.0.0" works), any specific device
-profile fields (a 2015 OnePlus One profile works), uploadDeviceConfig for pulls,
-Play Integrity / attestation (fails on our reference device; everything works anyway).
-UA and profile stay current in config.json as cheap insurance; bump
-`finsky.versionstring`/`version` there if Google ever starts enforcing again.
+"Android-Finsky/8.4.19" works; even a fake "99.0.0" works) and Play Integrity /
+attestation (fails on our reference device; everything works anyway). The UA
+stays current in config.json as cheap insurance; bump
+`finsky.versionstring`/`version` there if Google ever starts enforcing it.
 
 ## Maintenance (what breaks and how to fix it)
 
@@ -106,19 +131,13 @@ UA and profile stay current in config.json as cheap insurance; bump
 | `auth: AAS token rejected (BadAuthentication)` | token revoked: password/2SV change, "sign out all devices", security lockdown, manual revocation at myaccount.google.com/permissions | `xvfb-run -a python3 mint_aas.py` (one 2SV code) |
 | `device: device id rejected (DF-DFERH-01)` or empty catalog | registration pruned after long inactivity | remove gsf_id/security_token from config.json, then `python3 pull.py init` |
 | `fdfe: server 5xx` / network errors | transient | automatic retries (3x backoff); just rerun |
-| `no details for ...` / `Item not found` | package typo, delisted app, region lock, device filter (sdk too old), or the staged rollout has not reached this cohort | check the id; cohorts lag, retry later |
+| `no details for ...` / `Item not found` | package typo, delisted app, region lock, device filter (declared profile too old or too narrow: sdk, features, GL, ABIs), or the staged rollout has not reached this cohort | check the id; cohorts lag, retry later |
 | purchase `DF-DFERH-01` on a specific app while others pull fine | genuine server-side refusal (the acquire ceremony already ran): developer acquisition restriction, region, or account standing | try the app in the real Play Store on the same account; whatever error it shows is the answer |
 | everything else stale | Google bumped minimum client | bump `finsky.*` in config.json |
 
 `check`/`pull` auto-refresh the checkin once a day, keeping the registration alive.
 `selfcheck` diagnoses in order: config -> token file -> AAS validity -> device
 registration -> live FDFE call, printing the exact remedy for the failed stage.
-
-## Tests
-
-`python3 tests/run_fixtures.py` - offline fixture-matrix test for the signature
-verifier (11 crafted APKs, expected accept/reject matches the reference
-apksigner). See tests/README.md.
 
 ## Notes
 

@@ -50,8 +50,8 @@ def load_config(require_device=True):
     try:
         cfg = json.load(open(os.path.join(DIR, 'config.json')))
     except FileNotFoundError:
-        raise PullError('config', 'config.json not found (copy config.example.json and fill it in)',
-                        'cp config.example.json config.json && edit config.json')
+        raise PullError('config', 'config.json not found - the auth step creates it',
+                        'xvfb-run -a python3 mint_aas.py')
     except json.JSONDecodeError as e:
         raise PullError('config', 'config.json is not valid JSON: %s' % e)
     if not cfg.get('email'):

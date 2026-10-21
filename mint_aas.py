@@ -23,7 +23,12 @@ from playwright.sync_api import sync_playwright
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/131.0.0.0 Safari/537.36")
 DIR = os.path.dirname(os.path.abspath(__file__))
-CFG = json.load(open(os.path.join(DIR, 'config.json')))
+CFG_PATH = os.path.join(DIR, 'config.json')
+try:
+    CFG = json.load(open(CFG_PATH))
+except FileNotFoundError:
+    # first run: start from the shipped defaults; written back after the mint
+    CFG = json.load(open(os.path.join(DIR, 'config.example.json')))
 
 def read_secret(prompt, envfile):
     p = os.environ.get(envfile)
@@ -81,5 +86,10 @@ out = os.path.join(DIR, 'aas_token')
 open(out, 'w').write(r['Token'])
 os.chmod(out, 0o600)
 print("AAS token written to", out)
+# the only user input is the sign-in itself: persist it so nothing needs editing
+CFG['email'] = email
+json.dump(CFG, open(CFG_PATH, 'w'), indent=2, sort_keys=True)
+os.chmod(CFG_PATH, 0o600)
+print("config.json ready (defaults + your email - nothing to edit)")
 if not CFG.get('gsf_id'):
-    print("next step: python3 pull.py init   (registers a fresh device identity)")
+    print("next step: python3 pull.py init   (one-time device registration)")
