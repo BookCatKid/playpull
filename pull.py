@@ -276,12 +276,18 @@ def cmd_check(cfg, pkg):
     print('served: %s (vc %s)' % (vs, vc))
     return vs, vc
 
-def cmd_pull(cfg, pkg, want, pin_arg):
+def cmd_pull(cfg, pkg, want, pin_arg, vc_override=0):
     api = build_api(cfg)
     maybe_refresh_checkin(cfg)
     doc, vs, vc = get_details(api, pkg)
     print('served: %s (vc %s)' % (vs, vc))
-    if want and not vs.startswith(want):
+    if vc_override:
+        # Play still hosts many older builds: purchase+delivery with vc=N serves that
+        # exact build when it is still hosted, and refuses at the delivery step when
+        # it is not (measured on Open Camera: vc 90/80/50 all served exactly).
+        print('requested versionCode %s' % vc_override)
+        vc = vc_override
+    elif want and not vs.startswith(want):
         print('prefix %s not in served version - not pulling' % want); sys.exit(2)
     micros, currency = offer_price(doc)
     if micros:
@@ -305,8 +311,13 @@ def cmd_pull(cfg, pkg, want, pin_arg):
     dmsg = parse_wrapper(dl)
     dd = dmsg.payload.deliveryResponse.appDeliveryData
     if not dd.downloadUrl:
-        raise PullError('fdfe', 'delivery returned no URL (err=%s)'
-                        % (dmsg.commands.displayErrorMessage or 'none'))
+        err = dmsg.commands.displayErrorMessage or 'none'
+        hint = ''
+        if vc_override:
+            hint = (' Play no longer hosts build %s for this device/profile - it keeps only '
+                    'the versions it still serves (purchase grants a token either way; delivery '
+                    'is where an unhosted versionCode is refused).' % vc_override)
+        raise PullError('fdfe', 'delivery returned no URL (err=%s).%s' % (err, hint))
     cookie = '; '.join('%s=%s' % (c.name, c.value) for c in dd.downloadAuthCookie)
 
     def _sha(x):
@@ -721,6 +732,15 @@ if __name__ == '__main__':
         except IndexError:
             print('--pin-sha256 needs a hex value'); sys.exit(2)
         del argv[i:i + 2]
+    vc_override = 0
+    if '--version-code' in argv:
+        i = argv.index('--version-code')
+        try:
+            vc_override = int(argv[i + 1])
+            if vc_override <= 0: raise ValueError
+        except (IndexError, ValueError):
+            print('--version-code needs a positive integer'); sys.exit(2)
+        del argv[i:i + 2]
     cmd = argv[0] if argv else 'check'
     try:
         if cmd == 'init':
@@ -731,8 +751,8 @@ if __name__ == '__main__':
             cmd_check(load_config(), argv[1])
         elif cmd == 'pull':
             if len(argv) < 2:
-                print('usage: pull.py pull PACKAGE [VERSION_PREFIX] [--pin-sha256 HEX]'); sys.exit(2)
-            cmd_pull(load_config(), argv[1], argv[2] if len(argv) > 2 else '', pin)
+                print('usage: pull.py pull PACKAGE [VERSION_PREFIX] [--pin-sha256 HEX] [--version-code N]'); sys.exit(2)
+            cmd_pull(load_config(), argv[1], argv[2] if len(argv) > 2 else '', pin, vc_override)
         elif cmd == 'selfcheck':
             cmd_selfcheck()
         elif cmd == 'checkin':

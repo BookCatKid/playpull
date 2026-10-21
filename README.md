@@ -16,6 +16,7 @@ python3 pull.py init                            # one-time: register a fresh dev
 python3 pull.py check com.google.android.calculator
 python3 pull.py pull com.google.android.calculator            # TOFU: prints the signer
 python3 pull.py pull com.google.android.calculator 9.3 --pin-sha256 <sha256 from the TOFU print>
+python3 pull.py pull net.sourceforge.opencamera --version-code 80    # older build, if still hosted
 python3 pull.py selfcheck                       # stage-by-stage health check
 ```
 
@@ -41,6 +42,18 @@ download hash. `config.example.json` is the reference for the defaults.
 Downloads land in `./<package>/v<versionCode>/` (base.apk + split_*.apk), promoted
 there in one atomic rename after all checks pass; `./<package>/current` is a symlink
 to the latest version. A re-pull of an already-pulled version keeps the existing files.
+
+## Older versions
+
+Play keeps serving many older builds: pass `--version-code N` and purchase+delivery
+serve that exact build (measured on Open Camera: vc 90 -> 1.53.1, vc 80 -> 1.48.3,
+vc 50 -> 1.39, all signature-verified; details still reports only the current one).
+There is no version-history endpoint, so find old versionCodes elsewhere (APKMirror
+variant lists, your own records). Limits, measured: an unhosted or never-existent
+versionCode gets a purchase token but is refused at delivery with a clear error;
+how far back the catalog reaches is per app - Play prunes. The verifier still
+requires the downloaded APK's versionCode to equal the requested one, so a wrong
+or substituted build is rejected.
 
 ## Trust model
 
