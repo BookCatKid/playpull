@@ -30,6 +30,10 @@ Secrets: config.json (gitignored) holds email + device ids; aas_token (gitignore
 holds the master token. Neither is ever printed. See README.md for the full flow.
 """
 import sys, os, json, time, hashlib, struct, shutil
+# gpapi's generated protobuf code predates the protobuf 3.21+ runtime API; the
+# pure-Python implementation accepts it on every protobuf version. Must be set
+# before anything imports google.protobuf.
+os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 from loguru import logger as _loguru_logger
 _loguru_logger.remove()  # silence androguard's debug flood
 import requests
@@ -107,7 +111,7 @@ def oauth(email, aas, android_id, service, app, sdk=29):
     if 'Error' in r:
         if r['Error'] in ('BadAuthentication', 'NeedsBrowser', 'DeletedGmail'):
             raise PullError('auth', 'AAS token rejected (%s) - it expired or was revoked' % r['Error'],
-                            'python3 mint_aas.py  (needs the account password + one 2SV code)')
+                            'python3 mint_aas.py  (browser sign-in with one 2SV code)')
         raise PullError('auth', 'token mint failed: %s' % r)
     return r['Auth']
 
@@ -202,6 +206,15 @@ def maybe_refresh_checkin(cfg):
     except PullError as e:
         print('warning: checkin refresh failed (%s) - continuing with stale registration' % e)
 
+def fdfe_headers(api):
+    """Headers for FDFE calls. FDFE rejects the legacy GoogleLogin authorization
+    scheme with 401 DF-DFERH-01 (measured Oct 25, 2026; the same request with the
+    same token as 'Bearer <token>' succeeds)."""
+    h = api.getHeaders()
+    if api.authSubToken:
+        h['Authorization'] = 'Bearer ' + api.authSubToken
+    return h
+
 def build_api(cfg):
     email = cfg['email']; aas = load_aas()
     tok = oauth(email, aas, cfg['gsf_id'], service=PLAY_SCOPE, app=PLAY_APP)
@@ -244,7 +257,7 @@ def acquire(api, pkg, vc, ot=1):
     Mature 17+ titles); already-owned apps don't need it. The result is always
     printed - a failed acquire is not fatal on its own (owned apps skip it), but
     it must never be silent."""
-    h = api.getHeaders()
+    h = fdfe_headers(api)
     h['Content-Type'] = 'application/x-protobuf'
     try:
         r = requests.post(FDFE + 'acquire', headers=h, data=build_acquire_request(pkg, vc, ot), timeout=30)
@@ -267,7 +280,7 @@ def parse_wrapper(resp):
     return googleplay_pb2.ResponseWrapper.FromString(resp.content)
 
 def get_details(api, pkg):
-    r = _req('GET', FDFE + 'details', api.getHeaders(), params={'doc': pkg}, stage='fdfe', allow=(400,))
+    r = _req('GET', FDFE + 'details', fdfe_headers(api), params={'doc': pkg}, stage='fdfe', allow=(400,))
     msg = parse_wrapper(r)
     err = msg.commands.displayErrorMessage
     if r.status_code == 400 and 'DF-DFERH-01' in err:
@@ -326,7 +339,7 @@ def cmd_pull(cfg, pkg, want, pin_arg, vc_override=0, only_if_newer=False):
         raise PullError('fdfe', '%s is a paid app (%s %.2f). playpull only acquires free apps - '
                         'no purchase made' % (pkg, currency or '', micros / 1e6))
     acquire(api, pkg, vc)
-    h = api.getHeaders(); h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+    h = fdfe_headers(api); h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
     pr = _req('POST', FDFE + 'purchase', h, data={'ot': '1', 'doc': pkg, 'vc': str(vc)}, stage='fdfe')
     pmsg = parse_wrapper(pr)
     br = pmsg.payload.buyResponse
@@ -771,7 +784,7 @@ def _delivery_probe(api, pkg, vc):
     """True when Play grants a delivery for this exact versionCode (no bytes are
     downloaded). Measured: purchase grants a token for ANY vc, even ones that never
     existed; the delivery step is where an unhosted vc is refused."""
-    h = api.getHeaders(); h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+    h = fdfe_headers(api); h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
     pr = _req('POST', FDFE + 'purchase', h, data={'ot': '1', 'doc': pkg, 'vc': str(vc)},
               stage='fdfe')
     br = parse_wrapper(pr).payload.buyResponse

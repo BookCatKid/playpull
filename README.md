@@ -8,10 +8,10 @@ mirrors. Works for any free app.
 ## Quickstart
 
 ```
-pip install gpsoauth googleplay-api androguard cryptography playwright requests
+pip install gpsoauth gpapi androguard cryptography playwright requests
 python3 -m playwright install chromium
 
-xvfb-run -a python3 mint_aas.py                 # one-time: browser sign-in (password + 2SV); creates config.json
+xvfb-run -a python3 mint_aas.py                 # one-time: asks for your email, opens a browser to sign in, creates config.json
 python3 pull.py init                            # one-time: register a fresh device identity
 python3 pull.py check com.google.android.calculator
 python3 pull.py pull com.google.android.calculator            # TOFU: prints the signer
@@ -121,17 +121,19 @@ the developer's certificate; a re-signed stub does not.
 
 ## How it works (reproduced from an actual device)
 
-1. **Sign-in** (`mint_aas.py`): drives accounts.google.com/EmbeddedSetup in full
-   chromium (headless is rejected as "insecure"; use xvfb on a headless box).
-   Email -> password -> 2SV -> "I agree". On completion Google sets an HttpOnly
-   `oauth_token` cookie, **single-use**, which is exchanged for an **AAS master
-   token** (`aas_et/...`, written to `aas_token`, chmod 600). This mirrors what GMS
-   does on-device; raw password auth on android.clients.google.com/auth is dead
-   (BadAuthentication regardless of device trust).
+1. **Sign-in** (`mint_aas.py`): opens accounts.google.com/EmbeddedSetup in full
+   chromium (headless is rejected as "insecure"; use xvfb on a headless box) with
+   your email prefilled. You complete the sign-in in the window (password, 2SV,
+   whatever Google asks); the script never sees your password. On completion
+   Google sets an HttpOnly `oauth_token` cookie, **single-use**, which is
+   exchanged for an **AAS master token** (`aas_et/...`, written to `aas_token`,
+   chmod 600). This mirrors what GMS does on-device; raw password auth on
+   android.clients.google.com/auth is dead (BadAuthentication regardless of
+   device trust).
 2. **Device registration** (`pull.py init`): mints an `ac2dm` token from the AAS,
    then performs the two-step GMS checkin (anonymous -> account-bound) and uploads
    the device config. Result: a fresh GSF android_id registered to the account,
-   stored in config.json. Gotcha that cost an hour: the checkin POST needs
+   stored in config.json. The checkin POST needs
    `Content-Type: application/x-protobuffer` or the server answers HTTP 400.
 3. **Pulling** (`check`/`pull`): exchanges the AAS for a token scoped
    `oauth2:https://www.googleapis.com/auth/googleplay` (app com.android.vending),
@@ -171,6 +173,7 @@ stays current in config.json as cheap insurance; bump
 | `fdfe: server 5xx` / network errors | transient | automatic retries (3x backoff); just rerun |
 | `no details for ...` / `Item not found` | package typo, delisted app, region lock, device filter (declared profile too old or too narrow: sdk, features, GL, ABIs), or the staged rollout has not reached this cohort | check the id; cohorts lag, retry later |
 | purchase `DF-DFERH-01` on a specific app while others pull fine | genuine server-side refusal (the acquire ceremony already ran): developer acquisition restriction, region, or account standing | try the app in the real Play Store on the same account; whatever error it shows is the answer |
+| `ModuleNotFoundError: No module named 'gpapi'` | `googleplay-api` on PyPI is an unrelated package | `pip install gpapi` |
 | everything else stale | Google bumped minimum client | bump `finsky.*` in config.json |
 
 `check`/`pull` auto-refresh the checkin once a day, keeping the registration alive.
