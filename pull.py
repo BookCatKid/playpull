@@ -75,15 +75,23 @@ def die(e):
     sys.exit(1)
 
 def load_config(require_device=True):
+    p = os.path.join(DIR, 'config.json')
+    if not os.path.exists(p):
+        # first run: create config.json from the shipped defaults (never overwrites)
+        try:
+            cfg = json.load(open(os.path.join(DIR, 'config.example.json')))
+        except (OSError, json.JSONDecodeError) as e:
+            raise PullError('config', 'config.json missing and config.example.json unreadable: %s' % e,
+                            're-clone the repo so config.example.json is present')
+        save_config(cfg)
+        print('created config.json from config.example.json', file=sys.stderr)
     try:
-        cfg = json.load(open(os.path.join(DIR, 'config.json')))
-    except FileNotFoundError:
-        raise PullError('config', 'config.json not found - the auth step creates it',
-                        'xvfb-run -a python3 mint_aas.py')
+        cfg = json.load(open(p))
     except json.JSONDecodeError as e:
         raise PullError('config', 'config.json is not valid JSON: %s' % e)
     if not cfg.get('email'):
-        raise PullError('config', 'config.json has no email')
+        raise PullError('config', 'config.json has no email - sign-in has not been done yet',
+                        'xvfb-run -a python3 mint_aas.py')
     if require_device and not cfg.get('gsf_id'):
         raise PullError('device', 'no device registered yet (config.json has no gsf_id)',
                         'python3 pull.py init')
