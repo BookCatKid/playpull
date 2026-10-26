@@ -18,7 +18,7 @@ writes ./aas_token (0600).
 """
 import json, os, sys, time
 import gpsoauth
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Error as PWError
 
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/131.0.0.0 Safari/537.36")
@@ -41,32 +41,31 @@ with sync_playwright() as pw:
     pg.wait_for_selector('#identifierId', timeout=30000)
     pg.fill('#identifierId', email)
     pg.keyboard.press("Enter")
-    print("sign in in the browser window; the script never sees your password")
+    print("sign in in the browser window (including I agree if a consent screen appears); the script never sees your password")
 
-    # wait for the consent speedbump, then click the "I agree" button (exact match;
-    # a plain text= click can hit the sentence "'I Agree,'" in the body instead)
+    # Completion is the single-use HttpOnly oauth_token cookie; poll the
+    # context cookie jar for a non-empty value (document.cookie can't see it).
+    oauth = None
     deadline = time.time() + 900
     while time.time() < deadline:
-        if 'embeddedsigninconsent' in pg.url:
-            break
-        time.sleep(2)
-    else:
-        sys.exit("timed out waiting for sign-in to complete - still on %s" % pg.url)
-    pg.click('button:has-text("I agree")', timeout=15000)
-
-    # oauth_token is minted at flow completion; poll cookies until it appears.
-    # NB: the cookie is HttpOnly - document.cookie cannot see it, the context API can.
-    oauth = None
-    deadline = time.time() + 120
-    while time.time() < deadline:
-        for c in ctx.cookies():
-            if c['name'] == 'oauth_token':
+        try:
+            cookies = ctx.cookies()
+        except PWError as e:
+            if 'closed' in str(e).lower():
+                sys.exit("browser closed before sign-in completed; rerun mint_aas.py")
+            raise
+        for c in cookies:
+            if c['name'] == 'oauth_token' and c['value']:
                 oauth = c['value']
         if oauth:
             break
         time.sleep(2)
     if not oauth:
-        sys.exit("no oauth_token cookie - flow did not complete (url=%s)" % pg.url)
+        try:
+            url = pg.url
+        except Exception:
+            url = 'unknown'
+        sys.exit("no oauth_token cookie - flow did not complete (url=%s)" % url)
     ctx.close()
 
 r = gpsoauth.exchange_token(email, oauth, CFG.get('gsf_id') or '0')
@@ -83,3 +82,4 @@ os.chmod(CFG_PATH, 0o600)
 print("config.json ready (defaults + your email - nothing to edit)")
 if not CFG.get('gsf_id'):
     print("next step: python3 pull.py init   (one-time device registration)")
+
