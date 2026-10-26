@@ -11,7 +11,7 @@ mirrors. Works for any free app.
 pip install gpsoauth gpapi androguard cryptography playwright requests
 python3 -m playwright install chromium
 
-xvfb-run -a python3 mint_aas.py                 # one-time: asks for your email, opens a browser to sign in, creates config.json
+python3 mint_aas.py                             # one-time (macOS/desktop; on a headless Linux box: xvfb-run -a python3 mint_aas.py): asks for your email, opens a browser to sign in, creates config.json
 python3 pull.py init                            # one-time: register a fresh device identity
 python3 pull.py check com.google.android.calculator
 python3 pull.py pull com.google.android.calculator            # TOFU: prints the signer
@@ -168,7 +168,7 @@ stays current in config.json as cheap insurance; bump
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `auth: AAS token rejected (BadAuthentication)` | token revoked: password/2SV change, "sign out all devices", security lockdown, manual revocation at myaccount.google.com/permissions | `xvfb-run -a python3 mint_aas.py` (one 2SV code) |
+| `auth: AAS token rejected (BadAuthentication)` | token revoked: password/2SV change, "sign out all devices", security lockdown, manual revocation at myaccount.google.com/permissions | `python3 mint_aas.py` (`xvfb-run -a` prefix on headless Linux; one 2SV code) |
 | `device: device id rejected (DF-DFERH-01)` or empty catalog | registration pruned after long inactivity | remove gsf_id/security_token from config.json, then `python3 pull.py init` |
 | `fdfe: server 5xx` / network errors | transient | automatic retries (3x backoff); just rerun |
 | `no details for ...` / `Item not found` | package typo, delisted app, region lock, device filter (declared profile too old or too narrow: sdk, features, GL, ABIs), or the staged rollout has not reached this cohort | check the id; cohorts lag, retry later |

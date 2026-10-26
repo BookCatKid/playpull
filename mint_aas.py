@@ -6,7 +6,7 @@ Google retired raw password auth on android.clients.google.com/auth
 web flow (EmbeddedSetup), the same flow a real Android device runs, followed by
 an oauth_token -> AAS exchange.
 
-Requirements: playwright (+chromium), gpsoauth. Run under a real display or xvfb:
+Requirements: playwright (+chromium), gpsoauth. Run under a real display (macOS/desktop: python3 mint_aas.py) or, on a headless Linux box, xvfb:
     xvfb-run -a python3 mint_aas.py
 Headless chromium is rejected at the email step ("browser or app may not be secure").
 

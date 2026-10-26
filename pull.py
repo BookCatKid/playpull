@@ -74,6 +74,12 @@ def die(e):
         _REAL_STDOUT.write('\n')
     sys.exit(1)
 
+def mint_cmd():
+    # macOS/Windows and Linux desktops have a real display; only a headless Linux box needs xvfb
+    if sys.platform.startswith('linux') and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
+        return 'xvfb-run -a python3 mint_aas.py'
+    return 'python3 mint_aas.py'
+
 def load_config(require_device=True):
     p = os.path.join(DIR, 'config.json')
     if not os.path.exists(p):
@@ -91,7 +97,7 @@ def load_config(require_device=True):
         raise PullError('config', 'config.json is not valid JSON: %s' % e)
     if not cfg.get('email'):
         raise PullError('config', 'config.json has no email - sign-in has not been done yet',
-                        'xvfb-run -a python3 mint_aas.py')
+                        mint_cmd() + '   (it asks for your email, opens a browser to sign in)')
     if require_device and not cfg.get('gsf_id'):
         raise PullError('device', 'no device registered yet (config.json has no gsf_id)',
                         'python3 pull.py init')
